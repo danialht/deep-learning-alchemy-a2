@@ -244,3 +244,113 @@ The launcher stages a short Python script and submits it with `sbatch`. The
 function call string is evaluated in a script that imports your launch file, so
 keep imports like `from train import TrainConfig, train` at module scope and
 put submission calls behind the `__main__` guard to avoid resubmitting on import.
+
+## This cluster: H100 / H200 / B200
+
+`cluster_train.py` provides the same `launch_training_jobs(configs, ...)` pattern
+as `modal_train.py`, using Slurm job arrays. On this cluster the default partition
+is `mit_normal_gpu` (six-hour limit). It discovers GPU types with `sinfo` and
+excludes CPU, L40S, and nonmatching GPU nodes. By default each task can run on
+any H100, H200, or B200 node; Slurm chooses the type when scheduling. These GPUs
+share one partition, so this is a union of GPU types, not separate partitions.
+Use `gpu="H200"` for a single type, `gpu=("H100", "H200")` for a subset, or
+`gpu="any"` (also `None`) for the default pool. Comma-separated types also work.
+
+The cluster rewrites generic `--gres=gpu:1` requests to L40S. For a pool, the
+launcher instead uses `--gpus-per-task=1` with nonmatching nodes excluded; for
+a single type it uses a typed GRES. The array concurrency limit applies across
+all eligible GPU types, and tasks in the same array may use different types. One array task trains one configuration on one GPU.
+
+```python
+from cluster_train import launch_training_jobs
+from train import TrainConfig
+
+RUNS = [
+    TrainConfig(learning_rate=lr, run_name_suffix='cluster-lr-v1', wandb_online=False)
+    for lr in (.0015, .003, .006)
+]
+
+if __name__ == '__main__':
+    jobs = launch_training_jobs(
+        RUNS,
+        # Omit gpu to allow H100, H200, and B200.
+        max_parallel_runs=2,
+        dry_run=True,  # Remove after reviewing to submit the array.
+    )
+```
+
+For A2, replace the Modal import with:
+
+```python
+from experiments.a2.cluster_launcher import config, launch_training_jobs
+
+RUNS = [config(tokens=153_600_000, batch=128, learning_rate=.0015,
+               run_name_suffix='a2-cluster-v1')]
+
+if __name__ == '__main__':
+    launch_training_jobs(RUNS, gpu='H200', max_parallel_runs=2)
+```
+
+The A2 factory preserves diagnostics, accumulation, and optimizer routing. It
+uses local data under `DL_ALCHEMY_DATA_DIR` (or the `utils.py` default), reuses a
+seed-42 cache when available, and otherwise lets each worker materialize its
+shuffled prefix from the base dataset. Prepare reusable prefixes with
+`experiments.a2.data.stage_prefix` and pass explicit `train_dataset` overrides
+if repeated preparation becomes expensive. No data download or preprocessing
+runs on the login node during submission. Download the data before training,
+as described above. For diagnostics, retain `wandb_online=True` and configure
+local W&B credentials; setting it false disables the shared trainer's probes.
+
+The calling Python interpreter, environment, repository, dataset, and output
+paths must be accessible on compute nodes. The launcher uses that interpreter
+directly, without `uv sync` on workers. Configurations are frozen in JSON;
+custom builder/logger modules must remain importable from the shared checkout.
+Builder kwargs must be JSON serializable (tuples become lists). Keep the checkout
+unchanged while jobs are queued/running. Use distinct run-name suffixes for
+custom settings: completed model directories are skipped unless `force_run=True`,
+and training checkpoints resume according to `TrainConfig`.
+
+**B200 environment:** the course's pinned PyTorch 2.6 environment is suitable
+for H100/H200, but B200 needs a Blackwell-capable PyTorch/CUDA build. For example,
+create a separate shared environment with PyTorch 2.7.1 and CUDA 12.8 wheels:
+
+```bash
+uv venv --python 3.11 .venv-cluster
+uv pip install --python .venv-cluster/bin/python torch==2.7.1 \
+    --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv-cluster/bin/python numpy wandb==0.17.3 \
+    huggingface-hub matplotlib requests sentencepiece tqdm
+.venv-cluster/bin/python -m your_experiment_module
+```
+
+Use this environment for all GPUs when comparing results across hardware. Do not
+run `uv sync` against it: the root lockfile would restore the course's torch pin.
+The launcher rejects pools containing B200 from older builds (including the
+default pool); choose `gpu=("H100", "H200")` with the course environment. The worker verifies
+CUDA and the actual GPU type before training. See the
+[PyTorch Blackwell support announcement](https://pytorch.org/blog/pytorch-2-7/).
+
+Optional submission arguments include `partition`, `account`, `qos`, `gpus`,
+`cpus` (default 8), `mem` (64 GiB host RAM), `time_limit` (`06:00:00`), and
+`dependency` (e.g. `afterok:12345`). The default account is your Slurm default.
+Multiple GPUs use the existing trainer's single-node DataParallel behavior.
+`max_parallel_runs` limits concurrently running configurations, not GPUs.
+
+A dry run writes `configs.json`, `job.sh`, and the exact submission argument list
+`submit.json` beneath `temp_scripts/cluster-*`, prints the command, and returns
+job metadata without submitting. It does not verify GPU runtime compatibility.
+An actual submission returns `slurm_job_id` values such as `12345_0` and
+`log_path` for each run. Logs default to `slurmjobs/12345_0.out`.
+
+```bash
+squeue -u "$USER"
+sacct -j 12345 --format=JobID,State,Elapsed,ExitCode
+scancel 12345
+```
+
+The job forwards TERM/INT to Python and requests TERM two minutes before the
+wall-time limit so the existing trainer can checkpoint at an update boundary.
+There is no automatic resubmission; resubmit the same config to resume. A forced
+kill before checkpoint completion can lose progress since the last checkpoint.
+Both staging and logs use the existing `utils.py` path overrides and are ignored
+by Git. Keep staged files until the array finishes.

@@ -13,7 +13,11 @@ slurmjobs/
 .env.*
 .wandb.secret.env
 .venv/
+.venv-cluster/
 wandb/
+
+# Downloaded assignment handout (local only).
+/a2_hyperparameter_scaling.pdf
 
 
 # Local experiment artifacts
